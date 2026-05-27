@@ -24,10 +24,16 @@ from collections import defaultdict
 
 import pandas as pd
 import openpyxl
+
+os.environ.setdefault(
+    'MPLCONFIGDIR',
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), '.matplotlib')
+)
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
+from matplotlib import font_manager
 
 
 # ══════════════════════════════════════════════
@@ -120,6 +126,23 @@ TDX_PRICE_FILE = os.path.join(BASE_DIR, '通达信提取收盘价结果.xlsx')
 PRICE_FILE     = os.path.join(BASE_DIR, '股票池2025年收盘价.xlsx')
 OUTPUT_FILE = os.path.join(BASE_DIR, '万联2025净值.xlsx')
 CHART_FILE  = os.path.join(BASE_DIR, '万联2025净值图.png')
+
+
+def configure_matplotlib_chinese_font():
+    """选择当前电脑可用的中文字体，避免净值图中文显示成方块。"""
+    preferred_fonts = [
+        'PingFang SC', 'Hiragino Sans GB', 'Arial Unicode MS',
+        'Songti SC', 'STHeiti', 'Heiti TC', 'Microsoft YaHei',
+        'SimHei', 'Noto Sans CJK SC'
+    ]
+    available_fonts = {f.name for f in font_manager.fontManager.ttflist}
+    for font_name in preferred_fonts:
+        if font_name in available_fonts:
+            plt.rcParams['font.sans-serif'] = [font_name, 'DejaVu Sans']
+            break
+    else:
+        plt.rcParams['font.sans-serif'] = ['DejaVu Sans']
+    plt.rcParams['axes.unicode_minus'] = False
 
 
 # ══════════════════════════════════════════════
@@ -692,6 +715,65 @@ def is_new_stock_custody_transfer(txn, ipo_codes):
     return False
 
 
+def _convertible_root(name):
+    """提取配债/转债的同一主体名称，如“鼎龙配债”“鼎龙转债”都返回“鼎龙”。"""
+    s = str(name or '').strip()
+    if not s or s.lower() in ('nan', 'none'):
+        return ''
+    s = re.sub(r'(配债|转债|发债|可转债)$', '', s)
+    return s.strip()
+
+
+def build_convertible_bond_alias_map(transactions):
+    """把配债权利代码映射到正式转债代码。
+
+    例：380054 鼎龙配债 -> 123255 鼎龙转债。配债缴款发生时应形成
+    正式转债持仓成本，而不是留在配债权利代码上。
+    """
+    formal_by_root = {}
+    allot_by_root = {}
+    for txn in transactions or []:
+        code = normalize_sec_code(txn.get('sec_code', ''))
+        name = str(txn.get('sec_name', '') or '').strip()
+        root = _convertible_root(name)
+        if not root or not code:
+            continue
+        if '转债' in name:
+            formal_by_root[root] = code
+        elif '配债' in name:
+            allot_by_root[root] = code
+
+    alias = {}
+    for root, allot_code in allot_by_root.items():
+        formal_code = formal_by_root.get(root)
+        if formal_code:
+            alias[allot_code] = formal_code
+    return alias
+
+
+def is_convertible_allotment_payment(txn):
+    """识别可转债配债缴款流水。"""
+    biz = str(txn.get('biz_name', '') or '')
+    name = str(txn.get('sec_name', '') or '')
+    text = biz + name + str(txn.get('remark', '') or '') + str(txn.get('summary', '') or '')
+    return '配债' in text and ('缴款' in text or '买入' in biz)
+
+
+def is_convertible_allotment_intermediate(txn):
+    """识别配债过程中的权利上账/上市修正流水，避免重复形成持仓。"""
+    biz = str(txn.get('biz_name', '') or '')
+    text = (
+        biz
+        + str(txn.get('sec_name', '') or '')
+        + str(txn.get('remark', '') or '')
+        + str(txn.get('summary', '') or '')
+        + str(txn.get('operation', '') or '')
+    )
+    if '配债' not in text:
+        return False
+    return any(k in biz or k in text for k in ('权证上账', '股份上市', '交收股份修正'))
+
+
 def load_bank_transfers(transactions):
     """
     从流水中提取银行转存/转取记录，用于资金投入计算。
@@ -982,6 +1064,13 @@ def normalize_sec_code(code):
             s = s.zfill(6)
     return s
 
+
+def is_reverse_repo_code(code):
+    """逆回购品种按面值 100 估值。"""
+    code_s = normalize_sec_code(code)
+    return bool(code_s) and (code_s.startswith('204') or code_s == '131810')
+
+
 def parse_excel_date(v):
     """把 Excel 日期/字符串/20250103 数字统一转 date。"""
     if v is None:
@@ -1167,7 +1256,7 @@ def find_local_close_price(local_prices, code, target_date, max_lookback=240):
     code_s = normalize_sec_code(code)
     if not code_s:
         return None
-    if code_s.startswith('204'):
+    if is_reverse_repo_code(code_s):
         return 100.0
     if isinstance(target_date, datetime):
         target_date = target_date.date()
@@ -1227,8 +1316,8 @@ class LocalPriorityClosePriceProvider:
         lookback = int(max_lookback or self.lookback_days)
         d = target_date.date() if isinstance(target_date, datetime) else target_date
 
-        # 204001/GC001 这类逆回购按 100 估值。
-        if normalize_sec_code(code).startswith('204'):
+        # 204001/GC001、131810/R-001 这类逆回购按 100 估值。
+        if is_reverse_repo_code(code):
             return 100.0
 
         v = find_local_close_price(self.primary_prices, code, d, max_lookback=lookback)
@@ -1406,7 +1495,7 @@ class OnlineClosePriceProvider:
         code_s = normalize_sec_code(code)
         if not code_s:
             return None
-        if code_s.startswith('204'):
+        if is_reverse_repo_code(code_s):
             return 100.0
 
         if isinstance(target_date, datetime):
@@ -1593,6 +1682,33 @@ def is_hk_security(code, name=''):
     return False
 
 
+def is_convertible_bond_code(code, name=''):
+    """判断是否为可转债代码。"""
+    code_s = normalize_sec_code(code)
+    name_s = str(name or '')
+    return (
+        '转债' in name_s
+        or (code_s.isdigit() and len(code_s) == 6 and code_s.startswith(('110', '111', '113', '118', '123', '127', '128')))
+    )
+
+
+def normalize_convertible_bond_close(close, code, name=''):
+    """修正通达信转债价格口径。
+
+    当前本地通达信表里转债可能显示为 1300.01，而交易流水成交均价为 130.001。
+    对转债代码，若价格异常大于 500，则按除以 10 后的交易软件口径估值。
+    """
+    if close is None:
+        return None
+    try:
+        v = float(close)
+    except Exception:
+        return close
+    if is_convertible_bond_code(code, name) and v > 500:
+        return v / 10.0
+    return v
+
+
 def record_missing_price(price_provider, code, target_date, name='', reason='通达信收盘价表和股票池收盘价表均无数据'):
     """在所有兜底逻辑都失败后，再记录缺失价格。
 
@@ -1631,6 +1747,11 @@ def calc_position_value(positions, price_provider, target_date, hkd_rates, cash,
         close = find_close_price(price_provider, code, target_date, name=name)
         if close is None and ipo_price:
             close = ipo_price.get(normalize_sec_code(code)) or ipo_price.get(code)
+        close = normalize_convertible_bond_close(close, code, name)
+        # 配债缴款到正式转债上市之间，价格表通常没有转债行情。
+        # 此时按缴款成本价估值，避免现金已扣但资产被计为 0。
+        if close is None and cost and ('转债' in str(name) or '配债' in str(name)):
+            close = float(cost)
         hk_flag = is_hk_security(code, name)
         if close is not None:
             currency = 'HKD' if hk_flag else 'CNY'
@@ -1680,8 +1801,7 @@ def plot_nav_chart(nav_records, save_path, account_name=''):
         chart_year = datetime.now().year
     account_name = str(account_name or '').strip() or '账户'
 
-    plt.rcParams['font.sans-serif'] = ['Microsoft YaHei', 'SimHei', 'DejaVu Sans']
-    plt.rcParams['axes.unicode_minus'] = False
+    configure_matplotlib_chinese_font()
 
     fig, ax = plt.subplots(figsize=(14, 6))
 
@@ -1847,10 +1967,16 @@ def calc_vat():
         # 将日期列替换为正确datetime，确保输出时格式正确
         df['日期'] = df['_date']
 
+        formal_bond_by_root = {}
+        for _, r in df.iterrows():
+            nm = str(r.get('证券名称', '') or '')
+            if '转债' in nm and str(r.get('_code', '') or ''):
+                formal_bond_by_root[_convertible_root(nm)] = str(r.get('_code')).strip()
+
         # ── 4. 过滤有效买卖操作 ──
         def is_buy(biz):
             b = str(biz)
-            return '买入' in b or '新股入账' in b or '新股入帐' in b or '配股' in b
+            return '买入' in b or '新股入账' in b or '新股入帐' in b or '配股' in b or '配债缴款' in b
 
         def is_sell(biz):
             b = str(biz)
@@ -1875,6 +2001,8 @@ def calc_vat():
         for idx, row in df.iterrows():
             biz  = str(row['业务名称']) if pd.notna(row['业务名称']) else ''
             code = row['_code']
+            if '配债' in str(row.get('证券名称', '') or ''):
+                code = formal_bond_by_root.get(_convertible_root(row.get('证券名称', '')), code)
             qty_raw = row['成交数量'] if pd.notna(row['成交数量']) else 0
             price   = float(row['成交均价']) if pd.notna(row['成交均价']) else 0.0
             amt_raw = float(row['发生金额']) if '发生金额' in df.columns and pd.notna(row['发生金额']) else None
@@ -2074,6 +2202,7 @@ def compute_nav():
         rules                              = load_business_rules(logic_path)
         positions, cash, hkd_rates, init   = load_initial_positions(init_path)
         transactions                       = load_transactions_from_df(state['book'])
+        convertible_alias                  = build_convertible_bond_alias_map(transactions)
         bank_transfers                     = load_bank_transfers(transactions)
         tdx_prices                         = load_stock_pool_close_prices(tdx_price_path)
         fallback_prices                    = load_stock_pool_close_prices(fallback_price_path)
@@ -2093,6 +2222,8 @@ def compute_nav():
         text_pad.insert('insert', f'  业务规则: {len(rules)} 条\n')
         text_pad.insert('insert', f'  期初持仓: {len(positions)} 只, 现金: {cash:,.2f}, 期初总资产: {init:,.2f}\n')
         text_pad.insert('insert', f'  交易流水: {len(transactions)} 条\n')
+        if convertible_alias:
+            text_pad.insert('insert', f'  配债转债映射: {len(convertible_alias)} 组\n')
         text_pad.insert('insert', f'  银行转账: {len(bank_transfers)} 笔\n')
         text_pad.insert('insert', f'  收盘价:   通达信收盘价表优先，股票池收盘价表兜底，不联网；港股按汇率折人民币估值\n')
         text_pad.insert('insert', f'             通达信表：{tdx_price_path}，已读取 {len(tdx_prices)} 条价格/净值\n')
@@ -2149,6 +2280,23 @@ def compute_nav():
                         txn['biz_name'], txn['sec_code'], txn['sec_name'],
                         txn['qty'], txn['amount']
                     )
+                    if is_convertible_allotment_payment(txn) and code:
+                        target_code = convertible_alias.get(code, code)
+                        target_name = re.sub(r'配债$', '转债', str(name or target_code))
+                        unit_cost = float(amount or 0.0) / qty if qty else 0.0
+                        if target_code in positions:
+                            n, q, c = positions[target_code]
+                            positions[target_code] = (target_name or n, q + qty, c or unit_cost)
+                        else:
+                            positions[target_code] = (target_name, qty, unit_cost)
+                        cash -= float(amount or 0.0)
+                        continue
+                    if (
+                        is_convertible_allotment_intermediate(txn)
+                        or (code in convertible_alias and biz == '权证上账')
+                        or (code in set(convertible_alias.values()) and biz in ('股份上市', '交收股份修正', '交收股份修正取消'))
+                    ):
+                        continue
                     rule = rules.get(biz)
                     if rule is None:
                         continue
